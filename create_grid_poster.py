@@ -15,6 +15,7 @@ This module is the CLI entry point; the pipeline stages live in sibling modules:
 - ``common``   - shared constants, the on-disk cache, small utilities
 - ``osm_data`` - boundary resolution and Overpass downloads
 - ``prepare``  - OSM tag parsing and geometry preparation
+- ``pv_data``  - solar-PV capacity layers (EarthPV atlases, local files)
 - ``theming``  - themes and per-feature styling
 - ``render``   - poster composition and file output
 """
@@ -44,13 +45,17 @@ from osm_data import (
     load_boundary_from_geojson,
 )
 from prepare import prepare_lines, prepare_plants
+from pv_data import earthpv_url, load_pv_layer, prepare_pv
 from render import load_logo_image, render_poster
 from theming import list_themes, load_theme
 
 
-def output_path(country: str, theme_id: str, fmt: str) -> Path:
+def output_path(country: str, theme_id: str, fmt: str, variant: str = "") -> Path:
+    # ``variant`` (e.g. "earthpv") is appended to the theme so the gallery's
+    # manifest builder can flag posters with extra layers.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return POSTERS_DIR / f"{slugify(country)}_grid_{theme_id}_{timestamp}.{fmt}"
+    suffix = f"_{variant}" if variant else ""
+    return POSTERS_DIR / f"{slugify(country)}_grid_{theme_id}{suffix}_{timestamp}.{fmt}"
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -146,6 +151,47 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=1.0,
         help="Multiplier for plant marker sizes (default 1.0). Increase for sparse "
              "grids, decrease to reduce clutter.",
+    )
+    pv_source = parser.add_mutually_exclusive_group()
+    pv_source.add_argument(
+        "--earthpv",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Overlay solar-PV capacity from EarthPV as a glow under the grid. Without a "
+             "value, the published per-cell table for --country is downloaded from the "
+             "EarthPV atlas; pass a path or URL to use a local EarthPV-derived layer "
+             "(e.g. data/earthpv/pakistan_pv_best_1km.parquet).",
+    )
+    pv_source.add_argument(
+        "--pv-layer",
+        metavar="PATH",
+        help="Overlay any solar-PV capacity layer (GeoParquet, GeoJSON, GPKG, or a "
+             "parquet/CSV with lon/lat columns; points or polygons) as a glow under the grid.",
+    )
+    parser.add_argument(
+        "--pv-column",
+        help="Capacity column of the PV layer, in MWp. Default: the first of "
+             "mwp, mwp_best, capacity_mwp, capacity_mw, mw.",
+    )
+    parser.add_argument(
+        "--pv-label",
+        help="Legend label for the PV row (default: 'SOLAR PV (EARTHPV)' with --earthpv, "
+             "else 'SOLAR PV').",
+    )
+    parser.add_argument(
+        "--pv-intensity",
+        type=float,
+        default=1.0,
+        help="Brightness of the PV glow. Raise to lift sparse rural PV, lower to keep "
+             "only the densest clusters bright.",
+    )
+    parser.add_argument(
+        "--pv-glow-size",
+        type=float,
+        default=1.0,
+        help="Multiplier for the PV glow radii. Larger values give a softer, wider bloom.",
     )
     parser.add_argument(
         "--include-outlying",
@@ -411,6 +457,23 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
         )
         print(f"Plants after preparation: {len(plants_projected):,}")
 
+    pv_projected = None
+    if args.earthpv is not None or args.pv_layer:
+        source = args.pv_layer or args.earthpv or earthpv_url(args.country)
+        pv_projected = prepare_pv(
+            load_pv_layer(source, column=args.pv_column, use_cache=not args.no_cache),
+            boundary_wgs84,
+            args.crs,
+        )
+        if plants_projected is not None and not plants_projected.empty:
+            # Mapped solar plants are part of a PV capacity layer (EarthPV counts
+            # hand-mapped OSM arrays), so the glow already shows them; markers
+            # would draw them twice and split solar across two legend rows.
+            is_solar = plants_projected["source_bucket"] == "solar"
+            if is_solar.any():
+                print(f"Leaving {int(is_solar.sum()):,} solar plants to the PV layer")
+                plants_projected = plants_projected[~is_solar]
+
     if args.output:
         fmt = (args.output.suffix.lstrip(".") or args.format[0]).lower()
         if fmt not in {"png", "svg", "pdf"}:
@@ -418,7 +481,8 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
             return 2
         outputs = [(args.output, fmt)]
     else:
-        outputs = [(output_path(args.country, args.theme, f), f) for f in args.format]
+        variant = "earthpv" if args.earthpv is not None else "pv" if args.pv_layer else ""
+        outputs = [(output_path(args.country, args.theme, f, variant), f) for f in args.format]
 
     if args.export_geojson is not None:
         if args.export_geojson:
@@ -462,6 +526,11 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
         fade_bottom_alpha=args.fade_bottom_alpha,
         plants=plants_projected,
         plant_marker_scale=args.plant_marker_scale,
+        pv=pv_projected,
+        pv_label=args.pv_label or ("SOLAR PV (EARTHPV)" if args.earthpv is not None else "SOLAR PV"),
+        pv_intensity=args.pv_intensity,
+        pv_glow_size=args.pv_glow_size,
+        pv_credit="PV: EarthPV, Copernicus Sentinel-2, VIDA Open Buildings" if args.earthpv is not None else None,
     )
     return 0
 

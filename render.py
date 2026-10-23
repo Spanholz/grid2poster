@@ -15,7 +15,13 @@ from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea
 
 from common import DEFAULT_VOLTAGE_TIERS, MM_PER_INCH, tqdm
 from prepare import PLANT_SOURCE_BUCKETS
-from theming import Theme, compute_line_styles, compute_plant_styles, derive_plant_colors
+from theming import (
+    Theme,
+    compute_line_styles,
+    compute_plant_styles,
+    derive_plant_colors,
+    derive_pv_colormap,
+)
 
 # Half (thin) space placed between a number and its unit, e.g. "380 kV".
 # Rendered via matplotlib mathtext, where "\," is a thin space.
@@ -25,6 +31,9 @@ THIN_SPACE = r"$\,$"
 # the data lines (zorder ~2–8) and the gradient fades (10) so the text always
 # renders on top of the grid.
 TEXT_ZORDER = 100
+
+# Vertical spacing (axes fraction) between stacked metadata rows.
+METADATA_ROW_STEP = 0.024
 
 
 def set_country_extent(
@@ -103,6 +112,95 @@ def add_gradient_fade(
         zorder=zorder,
         origin="lower",
     )
+
+
+# Solar-PV glow: Gaussian radii (poster millimeters) and weights of the three
+# bloom layers. The core keeps individual towns crisp, the mid layer merges
+# them into urban clusters and the halo lifts the regional pattern, so the
+# layer reads like city lights from orbit at any paper size.
+PV_GLOW_LAYERS: tuple[tuple[float, float], ...] = ((0.22, 0.55), (1.1, 0.30), (5.0, 0.22))
+# Raster resolution of the glow; it is smooth, so it never needs print DPI.
+PV_GLOW_MAX_DPI = 200
+# Zorder above the boundary outline (1) and below every line group (>= 2).
+PV_GLOW_ZORDER = 1.5
+
+
+def _gaussian_blur(image: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Separable Gaussian blur via FFT; mass blurred past the edges is dropped.
+
+    Each axis is zero-padded by at least 4 sigma before the circular FFT
+    convolution, so nothing wraps around from the opposite edge.
+    """
+    if sigma_px < 0.3:
+        return image
+    out = image
+    for axis in (0, 1):
+        n = out.shape[axis]
+        nfft = 1 << int(np.ceil(np.log2(n + 4 * sigma_px + 1)))
+        kernel = np.exp(-2.0 * (np.pi * sigma_px * np.fft.rfftfreq(nfft)) ** 2)
+        shape = [1, 1]
+        shape[axis] = kernel.size
+        spectrum = np.fft.rfft(out, n=nfft, axis=axis) * kernel.reshape(shape)
+        out = np.take(np.fft.irfft(spectrum, n=nfft, axis=axis), np.arange(n), axis=axis)
+    return np.clip(out, 0.0, None)
+
+
+def draw_pv_glow(
+    ax: plt.Axes,
+    pv: gpd.GeoDataFrame,
+    cmap: mcolors.Colormap,
+    width: float,
+    height: float,
+    dpi: int,
+    intensity: float = 1.0,
+    glow_size: float = 1.0,
+) -> None:
+    """Render PV capacity points as a multi-scale glow under the grid lines.
+
+    Capacity is binned onto a raster covering the current axes extent, blurred
+    at the PV_GLOW_LAYERS radii, and tone-mapped. Each layer is normalized by a
+    high percentile of its own lit pixels and square-root compressed, because
+    PV density is heavy-tailed: one metro area can hold a tenth of a country's
+    capacity and would otherwise be the only thing visible.
+    """
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    raster_dpi = min(dpi, PV_GLOW_MAX_DPI)
+    nx = max(int(round(width * raster_dpi)), 1)
+    ny = max(int(round(height * raster_dpi)), 1)
+    density, _, _ = np.histogram2d(
+        pv.geometry.y.to_numpy(),
+        pv.geometry.x.to_numpy(),
+        bins=(ny, nx),
+        range=((y0, y1), (x0, x1)),
+        weights=pv["mwp"].to_numpy(dtype="float64"),
+    )
+
+    px_per_mm = raster_dpi / MM_PER_INCH
+    energy = np.zeros_like(density)
+    for radius_mm, weight in PV_GLOW_LAYERS:
+        layer = _gaussian_blur(density, radius_mm * glow_size * px_per_mm)
+        lit = layer[layer > layer.max() * 1e-6]
+        if lit.size == 0:
+            continue
+        energy += weight * np.sqrt(layer / np.percentile(lit, 99.5))
+
+    # Reinhard-style tone map: rural PV stays a faint haze, metro cores
+    # saturate smoothly into the hot end of the ramp instead of clipping.
+    exposure = 1.6 * intensity * energy
+    toned = exposure / (1.0 + exposure)
+    rgba = cmap(toned)
+
+    ax.imshow(
+        rgba,
+        extent=(x0, x1, y0, y1),
+        origin="lower",
+        interpolation="bilinear",
+        zorder=PV_GLOW_ZORDER,
+    )
+    # imshow autoscales to the image extent; restore the poster framing.
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
 
 
 def spaced_upper(text: str) -> str:
@@ -213,6 +311,11 @@ def render_poster(
     fade_bottom_alpha: float = 1.0,
     plants: gpd.GeoDataFrame | None = None,
     plant_marker_scale: float = 1.0,
+    pv: gpd.GeoDataFrame | None = None,
+    pv_label: str = "SOLAR PV",
+    pv_intensity: float = 1.0,
+    pv_glow_size: float = 1.0,
+    pv_credit: str | None = None,
 ) -> None:
     # A transparent backdrop keeps the grid, text and fades but drops the solid
     # theme background, so the poster can be composited over other artwork.
@@ -279,6 +382,23 @@ def render_poster(
     ax.set_aspect("equal", adjustable="box")
     set_country_extent(ax, boundary, width, height, padding=padding, shift_x=shift_x, shift_y=shift_y)
 
+    has_pv = pv is not None and not pv.empty
+    pv_cmap = derive_pv_colormap(theme, derive_plant_colors(theme)["solar"])
+    # Legend text takes the glow's mid-tone: gold on dark themes, a deeper
+    # ochre that stays legible on light ones.
+    pv_label_color = mcolors.to_hex(pv_cmap(0.6), keep_alpha=False)
+    if has_pv:
+        draw_pv_glow(
+            ax,
+            pv,
+            pv_cmap,
+            width,
+            height,
+            dpi,
+            intensity=pv_intensity,
+            glow_size=pv_glow_size,
+        )
+
     add_gradient_fade(ax, theme.fade, "bottom", zorder=10, height=fade_bottom_height, max_alpha=fade_bottom_alpha)
     add_gradient_fade(ax, theme.fade, "top", zorder=10, height=fade_top_height, max_alpha=fade_top_alpha)
 
@@ -297,6 +417,8 @@ def render_poster(
     high_voltage_length_km = float(lines.loc[lines["voltage_kv"].fillna(0) >= mid_kv].geometry.length.sum()) / 1000.0
     if subtitle is None:
         subtitle = "ELECTRICAL GRID" if include_minor_lines else "ELECTRICAL TRANSMISSION GRID"
+        if has_pv:
+            subtitle += " & SOLAR PV"
     metadata = f"{year} · {total_length_km:,.0f}{THIN_SPACE}km of power lines"
     if high_voltage_length_km:
         metadata += f" · {high_voltage_length_km:,.0f}{THIN_SPACE}km ≥{mid_kv:g}{THIN_SPACE}kV"
@@ -329,9 +451,14 @@ def render_poster(
                 gw = float(np.nan_to_num(bucket_gw[bucket]))
                 plant_rows.append((bucket.upper(), plant_color_map[bucket], gw))
 
+    # The title block sits above up to two metadata rows (voltages, plants). A
+    # PV row on top of both lifts the whole block by one row step, so the
+    # bottom row stays clear of the credit line.
+    lift = METADATA_ROW_STEP if include_metadata and plant_rows and has_pv else 0.0
+
     ax.text(
         0.5,
-        0.130,
+        0.130 + lift,
         spaced_upper(display_country),
         transform=ax.transAxes,
         ha="center",
@@ -342,7 +469,7 @@ def render_poster(
     )
     ax.text(
         0.5,
-        0.090,
+        0.090 + lift,
         subtitle,
         transform=ax.transAxes,
         ha="center",
@@ -374,11 +501,11 @@ def render_poster(
             children.append(_seg("·", theme.subtext, 0.85))
             children.append(_seg(label, color, 0.95))
             children.append(_seg(f"{tier_km:,.0f}{THIN_SPACE}km", theme.subtext, 0.85))
-        _add_metadata_row(children, 0.064)
+        _add_metadata_row(children, 0.064 + lift)
     elif include_metadata:
         ax.text(
             0.5,
-            0.064,
+            0.064 + lift,
             metadata,
             transform=ax.transAxes,
             ha="center",
@@ -400,19 +527,34 @@ def render_poster(
             children.append(_seg(f"{gw:,.1f}{THIN_SPACE}GW", theme.subtext, 0.85))
         _add_metadata_row(children, 0.040)
 
+    if include_metadata and has_pv:
+        # PV row, directly under the voltage row: total drawn capacity in GWp
+        # (peak DC, unlike the AC plant ratings in the plant row).
+        pv_gwp = float(pv["mwp"].sum()) / 1000.0
+        _add_metadata_row(
+            [
+                _seg(pv_label.upper(), pv_label_color, 0.95),
+                _seg(f"{pv_gwp:,.1f}{THIN_SPACE}GWp", theme.subtext, 0.85),
+            ],
+            0.040 + lift,
+        )
+
     ax.plot(
         [0.39, 0.61],
-        [0.112, 0.112],
+        [0.112 + lift, 0.112 + lift],
         transform=ax.transAxes,
         color=theme.text,
         linewidth=0.8 * scale,
         alpha=0.85,
         zorder=TEXT_ZORDER,
     )
+    credit = "© OpenStreetMap contributors, MapYourGrid, Open Energy Transition"
+    if has_pv and pv_credit:
+        credit += f" · {pv_credit}"
     ax.text(
         0.985,
         0.018,
-        "© OpenStreetMap contributors, MapYourGrid, Open Energy Transition · CC BY 4.0",
+        f"{credit} · CC BY 4.0",
         transform=ax.transAxes,
         ha="right",
         va="bottom",
@@ -435,6 +577,10 @@ def render_poster(
         }
         if fmt == "png":
             save_kwargs["dpi"] = dpi
+        elif has_pv:
+            # Vector backends resample embedded images (the PV glow) at the
+            # savefig DPI, which otherwise defaults to a blurry 100.
+            save_kwargs["dpi"] = min(dpi, PV_GLOW_MAX_DPI)
 
         output_file.parent.mkdir(exist_ok=True)
         fig.savefig(output_file, **save_kwargs)

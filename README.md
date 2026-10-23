@@ -24,6 +24,8 @@ Grid2Poster uses OpenStreetMap features tagged as:
 
 Feature completeness depends on OpenStreetMap coverage in the selected country or region.
 
+Optionally, solar PV capacity from [EarthPV](https://open-energy-transition.github.io/earthpv/) (rooftop and ground-mounted PV estimated from Sentinel-2 imagery) or any other capacity layer can be drawn as a glow underneath the grid.
+
 ### Contributing to the data
 
 Coverage and quality in your country can be improved by mapping transmission infrastructure directly in OpenStreetMap. [MapYourGrid](https://mapyourgrid.org) is a community initiative that coordinates this work. It provides tutorials, country-level completeness/quality statistics and mapping tools for tracing power lines, generators and substations from imagery. With [Open Infrastructure Map](https://openinframap.org/) you can browse all the electrical grid data in OpenStreetMap.
@@ -81,6 +83,29 @@ Power plants (`--show-plants`) are drawn as markers sized by installed capacity 
 ```bash
 python create_grid_poster.py --country Austria --show-plants --min-plant-capacity 10
 ```
+
+### Solar PV from EarthPV
+
+`--earthpv` overlays solar PV capacity as a glow beneath the transmission lines, like city lights seen from orbit. Bright cores mark the densest clusters of panels; a soft halo shows the regional pattern. Without a value it downloads the published per-cell table (0.1°, about 11 km) of the [EarthPV atlas](https://open-energy-transition.github.io/earthpv/) for `--country` (Pakistan, India, Egypt, France, Germany, Morocco, Nigeria, Poland, South Africa, Vietnam, Yemen, Zambia) and draws its Best estimate (`mwp_best`). A metadata row reports the drawn total in GWp, and the credit line adds EarthPV's data sources.
+
+```bash
+python create_grid_poster.py --country Pakistan --single-query --show-plants --earthpv --theme electric_midnight
+```
+
+Pass a path to use a finer EarthPV-derived layer instead. `data/earthpv/pakistan_pv_best_1km.parquet` spreads Pakistan's published Best estimate (24.4 GWp) onto a ~1 km grid, using EarthPV's per-building and per-detection results to place the capacity inside each 0.1° cell. Every cell keeps its published total, so only the texture is finer. `tools/earthpv_downscale.py` rebuilds it (or a layer for another country) from an EarthPV checkout. Like EarthPV's published outputs, the layer is licensed under the [ODbL](https://opendatacommons.org/licenses/odbl/1-0/) (© OpenStreetMap contributors, VIDA Open Buildings). The `solar_midnight` theme is made for this layer: a cool steel-blue grid leaves the warm end of the palette to solar.
+
+```bash
+python create_grid_poster.py --country Pakistan --single-query --show-plants \
+  --earthpv data/earthpv/pakistan_pv_best_1km.parquet --voltage-tiers 66,132,220,500 \
+  --padding 0.04 --shift-y 0.05 --fade-top-height 0.14 \
+  --subtitle "TRANSMISSION GRID, POWER PLANTS & SOLAR PV" --theme solar_midnight
+```
+
+<p align="center">
+  <img src="./posters/pakistan_grid_solar_midnight_earthpv_20261023_101624.png" alt="Pakistan transmission grid, power plants and EarthPV solar PV - solar_midnight theme" width="560"/>
+</p>
+
+Any other capacity layer works with `--pv-layer`: GeoParquet, GeoJSON or GPKG points or polygons, or a parquet/CSV with `lon`/`lat` columns. Values are read in MWp from `--pv-column`, or from the first column named `mwp`, `mwp_best`, `capacity_mwp`, `capacity_mw` or `mw`. Polygons are spread over their area. `--pv-intensity` brightens or dims the glow and `--pv-glow-size` widens or tightens the bloom. Posters with a PV layer get an `_earthpv` (or `_pv` for `--pv-layer`) suffix after the theme in their file name, which the gallery shows as a Solar PV badge. With `--show-plants`, solar plants are left to the glow (EarthPV's estimate already includes PV mapped in OSM), so the markers and the plant row show the rest of the fleet. The glow takes its hue from the theme's solar plant color; a theme can set it with `pv_color`. On dark themes it glows towards white, on light themes it darkens like ink.
 
 Use a local GeoJSON file as the boundary instead of geocoding (handy for custom regions or sub-national areas). All polygonal features in the file are dissolved into a single boundary. The `--country` value is still used for the poster title and output filename. `--landscape` will render in landscape (horizontal) orientation.
 ```bash
@@ -163,6 +188,12 @@ What each flag contributes:
 | `--show-plants` | off | Fetch `power=plant` features and overlay them as markers sized by capacity (`plant:output:electricity`) and colored by source (`plant:source`). |
 | `--min-plant-capacity` | `0.0` | Only draw plants with at least this electrical output in MW. Plants with unknown capacity are dropped when set. |
 | `--plant-marker-scale` | `1.0` | Multiplier for plant marker sizes. Increase for sparse grids, decrease to reduce clutter. |
+| `--earthpv` | off | Overlay solar PV capacity from [EarthPV](https://open-energy-transition.github.io/earthpv/) as a glow under the grid. Without a value, the published per-cell table for `--country` is downloaded; pass a path or URL for a local EarthPV-derived layer such as `data/earthpv/pakistan_pv_best_1km.parquet`. |
+| `--pv-layer` | - | Overlay any solar PV capacity layer (GeoParquet, GeoJSON, GPKG, or parquet/CSV with `lon`/`lat`; points or polygons) as a glow. Cannot be combined with `--earthpv`. |
+| `--pv-column` | auto | Capacity column of the PV layer, in MWp. Defaults to the first of `mwp`, `mwp_best`, `capacity_mwp`, `capacity_mw`, `mw`. |
+| `--pv-label` | `SOLAR PV (EARTHPV)` / `SOLAR PV` | Legend label of the PV metadata row. |
+| `--pv-intensity` | `1.0` | Brightness of the PV glow. Raise to lift sparse rural PV, lower to keep only the densest clusters bright. |
+| `--pv-glow-size` | `1.0` | Multiplier for the PV glow radii. Larger values give a softer, wider bloom. |
 | `--include-outlying` | off | Keep overseas territories and other polygons far from the main landmass. By default the geocoded boundary is filtered to the mainland (and nearby islands), so posters for countries like the Netherlands or France do not include Aruba, Curaçao, French Guiana, etc. |
 | `--paper-size` | - | Named preset, portrait orientation. Overrides `--width`/`--height`. Choices: `a5`, `a4`, `a3`, `a2`, `a1`, `a0`, `letter`, `legal`, `tabloid`. Combine with `--landscape` to flip. |
 | `--width` | `297.0` | Poster width in millimeters (default: A3 short side). |

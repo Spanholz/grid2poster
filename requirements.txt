@@ -3,5 +3,6 @@ geopandas
 matplotlib
 numpy
 pandas
+pyarrow
 shapely
 tqdm

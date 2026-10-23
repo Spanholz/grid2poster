@@ -103,6 +103,9 @@ class Theme:
     plant_biomass: str | None = None
     plant_other: str | None = None
     plant_edge: str | None = None
+    # Optional base color for the solar-PV glow (--pv-layer / --earthpv). When
+    # None the glow follows the theme's solar plant color.
+    pv_color: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Theme":
@@ -144,6 +147,7 @@ class Theme:
             "plant_biomass",
             "plant_other",
             "plant_edge",
+            "pv_color",
         ):
             if key in raw:
                 kwargs[key] = raw[key]
@@ -230,6 +234,33 @@ def derive_plant_colors(theme: Theme) -> dict[str, str]:
         l = float(np.clip(base_l * l_mult, 0.08, 0.92))
         colors[bucket] = mcolors.to_hex(colorsys.hls_to_rgb(hue / 360.0, l, s))
     return colors
+
+
+def derive_pv_colormap(theme: Theme, solar_color: str) -> mcolors.ListedColormap:
+    """RGBA ramp for the solar-PV glow, transparent at zero intensity.
+
+    The hue comes from ``theme.pv_color`` or the theme's solar plant color. On
+    dark backgrounds the ramp is emissive (dim ember → solar hue → near-white
+    core, like city lights from orbit); on light backgrounds it reads as ink
+    (pale wash → solar hue → deep burnt core).
+    """
+    hue, light, sat = colorsys.rgb_to_hls(*mcolors.to_rgb(theme.pv_color or solar_color))
+    t = np.linspace(0.0, 1.0, 256)
+    if colorsys.rgb_to_hls(*mcolors.to_rgb(theme.bg))[1] < 0.5:
+        hues = hue - 0.045 * (1.0 - t) + 0.015 * t
+        lights = 0.22 + 0.75 * t**1.25
+        sats = np.clip(sat, 0.75, 1.0) * (1.0 - 0.55 * t**3)
+        alphas = np.clip(1.25 * t**0.7, 0.0, 0.97)
+    else:
+        hues = hue + 0.01 * (1.0 - t) - 0.06 * t
+        lights = 0.62 - 0.36 * t
+        sats = np.clip(sat, 0.7, 0.95) * (0.85 + 0.15 * t)
+        alphas = np.clip(1.5 * t**0.85, 0.0, 0.95)
+    rgba = np.array([
+        (*colorsys.hls_to_rgb(h % 1.0, float(np.clip(l, 0.0, 1.0)), float(np.clip(s, 0.0, 1.0))), a)
+        for h, l, s, a in zip(hues, lights, sats, alphas)
+    ])
+    return mcolors.ListedColormap(rgba, name="pv_glow")
 
 
 def compute_line_styles(
